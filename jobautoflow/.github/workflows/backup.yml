@@ -1,0 +1,198 @@
+# 💾 Automated Backup Workflow
+# Runs daily backups of database and uploads to S3
+
+name: 💾 Daily Backup
+
+on:
+  schedule:
+    # Run daily at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      backup_type:
+        description: 'Backup Type'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - database-only
+          - files-only
+
+env:
+  AWS_REGION: us-east-1
+  BACKUP_BUCKET: jobautoflow-backups
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ============================================
+  # DATABASE BACKUP
+  # ============================================
+  backup-database:
+    name: 🗄️ Backup Database
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKUP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🗄️ Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: 💾 Create database backup
+        run: |
+          DATE=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="jobautoflow_db_${DATE}.sql.gz"
+          
+          echo "Creating backup: $BACKUP_FILE"
+          pg_dump "${{ secrets.PROD_DATABASE_URL }}" | gzip > "/tmp/$BACKUP_FILE"
+          
+          echo "Uploading to S3..."
+          aws s3 cp "/tmp/$BACKUP_FILE" "s3://${{ env.BACKUP_BUCKET }}/database/"
+          
+          echo "Backup completed: $BACKUP_FILE"
+          echo "backup-file=$BACKUP_FILE" >> $GITHUB_ENV
+
+      - name: 🧹 Cleanup old backups (keep 30 days)
+        run: |
+          echo "Cleaning up backups older than 30 days..."
+          aws s3 ls "s3://${{ env.BACKUP_BUCKET }}/database/" | \
+            awk '{print $4}' | \
+            while read file; do
+              FILE_DATE=$(echo $file | grep -oP '\d{8}')
+              CUTOFF_DATE=$(date -d '30 days ago' +%Y%m%d)
+              
+              if [[ "$FILE_DATE" < "$CUTOFF_DATE" ]]; then
+                echo "Deleting old backup: $file"
+                aws s3 rm "s3://${{ env.BACKUP_BUCKET }}/database/$file"
+              fi
+            done
+
+      - name: ✅ Verify backup
+        run: |
+          aws s3 ls "s3://${{ env.BACKUP_BUCKET }}/database/" | tail -5
+
+  # ============================================
+  # RDS SNAPSHOT
+  # ============================================
+  create-rds-snapshot:
+    name: 📸 Create RDS Snapshot
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: ⚙️ Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKUP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 📸 Create RDS snapshot
+        run: |
+          DATE=$(date +%Y%m%d-%H%M%S)
+          SNAPSHOT_ID="jobautoflow-auto-${DATE}"
+          
+          echo "Creating RDS snapshot: $SNAPSHOT_ID"
+          aws rds create-db-snapshot \
+            --db-instance-identifier jobautoflow-db \
+            --db-snapshot-identifier "$SNAPSHOT_ID"
+          
+          echo "Waiting for snapshot to complete..."
+          aws rds wait db-snapshot-available \
+            --db-snapshot-identifier "$SNAPSHOT_ID"
+          
+          echo "Snapshot created successfully: $SNAPSHOT_ID"
+
+      - name: 🧹 Cleanup old RDS snapshots
+        run: |
+          echo "Cleaning up snapshots older than 30 days..."
+          aws rds describe-db-snapshots \
+            --snapshot-type manual \
+            --query 'DBSnapshots[?starts_with(DBSnapshotIdentifier, `jobautoflow-auto-`)].[DBSnapshotIdentifier, SnapshotCreateTime]' \
+            --output text | \
+            while read snapshot_id create_time; do
+              CREATE_DATE=$(date -d "$create_time" +%s)
+              CUTOFF_DATE=$(date -d '30 days ago' +%s)
+              
+              if [[ $CREATE_DATE -lt $CUTOFF_DATE ]]; then
+                echo "Deleting old snapshot: $snapshot_id"
+                aws rds delete-db-snapshot \
+                  --db-snapshot-identifier "$snapshot_id" || true
+              fi
+            done
+
+  # ============================================
+  # FILES BACKUP (S3)
+  # ============================================
+  backup-files:
+    name: 📁 Backup Files
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: ⚙️ Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKUP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 📁 Sync S3 files to backup bucket
+        run: |
+          DATE=$(date +%Y%m%d_%H%M%S)
+          
+          echo "Syncing uploads to backup bucket..."
+          aws s3 sync \
+            s3://jobautoflow-uploads/ \
+            "s3://${{ env.BACKUP_BUCKET }}/files/${DATE}/" \
+            --storage-class STANDARD_IA
+          
+          echo "Files backup completed: $DATE"
+
+  # ============================================
+  # NOTIFICATION
+  # ============================================
+  notify:
+    name: 📢 Notify
+    needs: [backup-database, create-rds-snapshot, backup-files]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: ✅ Success notification
+        if: needs.backup-database.result == 'success' && needs.create-rds-snapshot.result == 'success'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          channel: '#backups'
+          text: |
+            ✅ *Daily Backup Completed*
+            
+            • Database: Backed up and uploaded to S3
+            • RDS Snapshot: Created successfully
+            • Files: Synced to backup bucket
+            • Date: ${{ github.event.schedule }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: ❌ Failure notification
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          channel: '#alerts'
+          text: |
+            🚨 *Backup Failed!*
+            
+            Please check the logs immediately.
+            Run ID: ${{ github.run_id }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

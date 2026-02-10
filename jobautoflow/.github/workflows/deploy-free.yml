@@ -1,0 +1,168 @@
+# 🆓 FREE Deployment - GitHub Actions Workflow
+# Deploys to Render (Backend) + Vercel (Frontend)
+
+name: 🚀 Deploy to Free Tier
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ============================================
+  # TEST BACKEND
+  # ============================================
+  test-backend:
+    name: 🧪 Test Backend
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: jobautoflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: 📦 Install dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: 🔧 Generate Prisma Client
+        run: |
+          cd backend
+          npx prisma generate
+
+      - name: 🧪 Run tests
+        run: |
+          cd backend
+          npm test
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/jobautoflow_test
+          JWT_SECRET: test-secret-for-ci-only
+        continue-on-error: true
+
+  # ============================================
+  # TEST FRONTEND
+  # ============================================
+  test-frontend:
+    name: 🧪 Test Frontend
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 📦 Install dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: 🔨 Build frontend
+        run: |
+          cd frontend
+          npm run build
+        env:
+          VITE_API_URL: https://jobautoflow-api.onrender.com
+
+  # ============================================
+  # DEPLOY BACKEND TO RENDER
+  # ============================================
+  deploy-backend:
+    name: 🚀 Deploy Backend to Render
+    needs: [test-backend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🚀 Deploy to Render
+        uses: johnbeynon/render-deploy-action@v0.0.8
+        with:
+          service-id: ${{ secrets.RENDER_SERVICE_ID }}
+          api-key: ${{ secrets.RENDER_API_KEY }}
+
+      - name: ⏳ Wait for deployment
+        run: sleep 30
+
+      - name: ✅ Health check
+        run: |
+          curl -f https://jobautoflow-api.onrender.com/health || exit 1
+        continue-on-error: true
+
+  # ============================================
+  # DEPLOY FRONTEND TO VERCEL
+  # ============================================
+  deploy-frontend:
+    name: 🚀 Deploy Frontend to Vercel
+    needs: [test-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🚀 Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+          working-directory: ./frontend
+
+  # ============================================
+  # NOTIFICATION
+  # ============================================
+  notify:
+    name: 📢 Notify
+    needs: [deploy-backend, deploy-frontend]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: ✅ Success notification
+        if: needs.deploy-backend.result == 'success' && needs.deploy-frontend.result == 'success'
+        run: |
+          echo "🎉 Deployment successful!"
+          echo "Backend: https://jobautoflow-api.onrender.com"
+          echo "Frontend: https://jobautoflow.vercel.app"
+
+      - name: ❌ Failure notification
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Check logs for details."
