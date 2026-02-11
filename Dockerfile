@@ -1,4 +1,4 @@
-// frontend/Dockerfile (production)
+# frontend/Dockerfile (production)
 FROM node:20-alpine AS dependencies
 
 WORKDIR /app
