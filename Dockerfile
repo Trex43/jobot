@@ -60,7 +60,7 @@ ENTRYPOINT ["dumb-init", "--"]
 
 CMD ["npm", "start"]
 
-// frontend/Dockerfile.dev (development)
+# frontend/Dockerfile.dev (development)
 FROM node:20-alpine
 
 WORKDIR /app
